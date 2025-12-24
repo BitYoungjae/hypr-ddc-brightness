@@ -12,9 +12,9 @@ I got a Lofree Flow 2 keyboard with a touchbar for brightness control. It didn't
 - Touchbars send rapid events (15-28ms intervals) that overwhelm DDC/CI
 
 **The solution:**
-- Cache-based instant OSD feedback
+- Delta-based calculation with real DDC read after debounce
 - 200ms debounce with flock + timestamps
-- Only the final brightness value is sent via DDC/CI
+- Works correctly even after adjusting brightness via monitor buttons
 
 ## Requirements
 
@@ -53,10 +53,11 @@ binde = ALT, XF86MonBrightnessDown, exec, ~/.local/bin/bright - 1
 
 ## How It Works
 
-1. `flock` locks the cache for atomic updates
-2. OSD shows immediately from cache
-3. After 200ms, check if this was the last event
-4. If yes, send DDC command. If not, skip.
+1. Each input accumulates delta (+10, +10, +10...)
+2. `flock` ensures atomic delta updates
+3. OSD shows immediately (estimated value)
+4. After 200ms debounce, read actual brightness via DDC
+5. Apply delta to real value and send DDC command
 
 ## Related
 
