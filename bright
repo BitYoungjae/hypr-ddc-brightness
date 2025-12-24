@@ -1,0 +1,107 @@
+#!/usr/bin/env sh
+set +e
+
+STEP=10
+DDC_OPTS="--noverify --sleep-multiplier=.2"
+CACHE_DIR="$HOME/.cache/bright"
+MAP_FILE="$CACHE_DIR/monitors"
+LOCK_FILE="$CACHE_DIR/lock"
+DEBOUNCE_MS=200
+
+mkdir -p "$CACHE_DIR"
+
+init_monitors() {
+    ddcutil detect --brief 2>/dev/null | awk '
+        /I2C bus:/ { gsub(/.*i2c-/, "", $3); bus=$3 }
+        /DRM connector:/ { print $3, bus }
+    ' > "$MAP_FILE"
+    echo "Monitor mapping:"
+    cat "$MAP_FILE"
+}
+
+sync_brightness() {
+    [ ! -f "$MAP_FILE" ] && init_monitors
+    echo "Syncing brightness..."
+    while read -r connector bus; do
+        brightness=$(ddcutil $DDC_OPTS --bus="$bus" getvcp 10 --brief 2>/dev/null | awk '{print $4}')
+        if [ -n "$brightness" ]; then
+            echo "$brightness" > "$CACHE_DIR/bus-$bus"
+            echo "  $connector (bus $bus): $brightness%"
+        fi
+    done < "$MAP_FILE"
+}
+
+if [ "$1" = "--init" ] || [ "$1" = "-i" ]; then
+    init_monitors
+    sync_brightness
+    exit 0
+fi
+
+if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    echo "Usage: $0 [+|-] [step]  |  $0 --init"
+    exit 0
+fi
+
+if [ "$1" != "+" ] && [ "$1" != "-" ]; then
+    echo "Direction must be '+' or '-'"
+    exit 1
+fi
+
+direction="$1"
+[ -n "$2" ] && STEP="$2"
+
+[ ! -f "$MAP_FILE" ] && init_monitors >/dev/null
+
+focused_name=$(hyprctl monitors -j | jq -r '.[] | select(.focused) | .name')
+BUS=$(grep "card1-$focused_name" "$MAP_FILE" 2>/dev/null | awk '{print $2}')
+
+if [ -z "$BUS" ]; then
+    echo "Monitor '$focused_name' not found. Run: $0 --init"
+    exit 1
+fi
+
+CACHE_FILE="$CACHE_DIR/bus-$BUS"
+TS_FILE="$CACHE_DIR/ts-$BUS"
+
+now=$(date +%s%3N)
+
+(
+    flock -x 200
+
+    if [ -f "$CACHE_FILE" ]; then
+        current=$(cat "$CACHE_FILE")
+    else
+        current=50
+    fi
+
+    if [ "$direction" = "+" ]; then
+        new=$((current + STEP))
+        [ $new -gt 100 ] && new=100
+    else
+        new=$((current - STEP))
+        [ $new -lt 0 ] && new=0
+    fi
+
+    echo "$new" > "$CACHE_FILE"
+    echo "$now" > "$TS_FILE"
+
+) 200>"$LOCK_FILE"
+
+new=$(cat "$CACHE_FILE")
+
+progress=$(awk "BEGIN {printf \"%.2f\", $new / 100}")
+swayosd-client --monitor="$focused_name" --custom-icon=display-brightness-symbolic --custom-progress="$progress" --custom-progress-text="${new}%" &
+
+(
+    sleep 0.$DEBOUNCE_MS
+
+    if [ -f "$TS_FILE" ]; then
+        saved_ts=$(cat "$TS_FILE")
+        if [ "$saved_ts" != "$now" ]; then
+            exit 0
+        fi
+    fi
+
+    final=$(cat "$CACHE_FILE")
+    ddcutil $DDC_OPTS --bus="$BUS" setvcp 10 "$final" 2>/dev/null
+) &
