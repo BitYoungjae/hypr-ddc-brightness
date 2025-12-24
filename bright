@@ -10,6 +10,7 @@ DEBOUNCE_MS=200
 
 mkdir -p "$CACHE_DIR"
 
+# 모니터 매핑 생성
 init_monitors() {
     ddcutil detect --brief 2>/dev/null | awk '
         /I2C bus:/ { gsub(/.*i2c-/, "", $3); bus=$3 }
@@ -19,6 +20,7 @@ init_monitors() {
     cat "$MAP_FILE"
 }
 
+# 현재 밝기 동기화
 sync_brightness() {
     [ ! -f "$MAP_FILE" ] && init_monitors
     echo "Syncing brightness..."
@@ -26,22 +28,26 @@ sync_brightness() {
         brightness=$(ddcutil $DDC_OPTS --bus="$bus" getvcp 10 --brief 2>/dev/null | awk '{print $4}')
         if [ -n "$brightness" ]; then
             echo "$brightness" > "$CACHE_DIR/bus-$bus"
+            echo "0" > "$CACHE_DIR/delta-$bus"
             echo "  $connector (bus $bus): $brightness%"
         fi
     done < "$MAP_FILE"
 }
 
+# --init 처리
 if [ "$1" = "--init" ] || [ "$1" = "-i" ]; then
     init_monitors
     sync_brightness
     exit 0
 fi
 
+# 도움말
 if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
     echo "Usage: $0 [+|-] [step]  |  $0 --init"
     exit 0
 fi
 
+# 방향 확인
 if [ "$1" != "+" ] && [ "$1" != "-" ]; then
     echo "Direction must be '+' or '-'"
     exit 1
@@ -50,8 +56,10 @@ fi
 direction="$1"
 [ -n "$2" ] && STEP="$2"
 
+# 모니터 매핑 없으면 생성
 [ ! -f "$MAP_FILE" ] && init_monitors >/dev/null
 
+# 포커스된 모니터 찾기
 focused_name=$(hyprctl monitors -j | jq -r '.[] | select(.focused) | .name')
 BUS=$(grep "card1-$focused_name" "$MAP_FILE" 2>/dev/null | awk '{print $2}')
 
@@ -61,47 +69,84 @@ if [ -z "$BUS" ]; then
 fi
 
 CACHE_FILE="$CACHE_DIR/bus-$BUS"
+DELTA_FILE="$CACHE_DIR/delta-$BUS"
 TS_FILE="$CACHE_DIR/ts-$BUS"
 
+# 현재 타임스탬프 (밀리초)
 now=$(date +%s%3N)
 
+# flock으로 atomic하게 delta 누적
 (
     flock -x 200
 
-    if [ -f "$CACHE_FILE" ]; then
-        current=$(cat "$CACHE_FILE")
+    # 현재 delta 읽기
+    if [ -f "$DELTA_FILE" ]; then
+        delta=$(cat "$DELTA_FILE")
     else
-        current=50
+        delta=0
     fi
 
+    # delta 누적
     if [ "$direction" = "+" ]; then
-        new=$((current + STEP))
-        [ $new -gt 100 ] && new=100
+        delta=$((delta + STEP))
     else
-        new=$((current - STEP))
-        [ $new -lt 0 ] && new=0
+        delta=$((delta - STEP))
     fi
 
-    echo "$new" > "$CACHE_FILE"
+    # delta와 타임스탬프 갱신
+    echo "$delta" > "$DELTA_FILE"
     echo "$now" > "$TS_FILE"
+
+    # OSD용 추정값 계산 (캐시 기반)
+    if [ -f "$CACHE_FILE" ]; then
+        cached=$(cat "$CACHE_FILE")
+    else
+        cached=50
+    fi
+    estimated=$((cached + delta))
+    [ $estimated -gt 100 ] && estimated=100
+    [ $estimated -lt 0 ] && estimated=0
+    echo "$estimated" > "$CACHE_DIR/osd-$BUS"
 
 ) 200>"$LOCK_FILE"
 
-new=$(cat "$CACHE_FILE")
+# OSD 즉시 표시 (추정값 기반)
+estimated=$(cat "$CACHE_DIR/osd-$BUS")
+progress=$(awk "BEGIN {printf \"%.2f\", $estimated / 100}")
+swayosd-client --monitor="$focused_name" --custom-icon=display-brightness-symbolic --custom-progress="$progress" --custom-progress-text="${estimated}%" &
 
-progress=$(awk "BEGIN {printf \"%.2f\", $new / 100}")
-swayosd-client --monitor="$focused_name" --custom-icon=display-brightness-symbolic --custom-progress="$progress" --custom-progress-text="${new}%" &
-
+# debounce 후 DDC 실행 (백그라운드)
 (
     sleep 0.$DEBOUNCE_MS
 
+    # 타임스탬프 확인: 내가 마지막 이벤트인지?
     if [ -f "$TS_FILE" ]; then
         saved_ts=$(cat "$TS_FILE")
         if [ "$saved_ts" != "$now" ]; then
+            # 새 이벤트가 있음 → 실행 취소
             exit 0
         fi
     fi
 
-    final=$(cat "$CACHE_FILE")
-    ddcutil $DDC_OPTS --bus="$BUS" setvcp 10 "$final" 2>/dev/null
+    # DDC로 현재 실제 밝기 읽기
+    current=$(ddcutil $DDC_OPTS --bus="$BUS" getvcp 10 --brief 2>/dev/null | awk '{print $4}')
+    [ -z "$current" ] && exit 1
+
+    # delta 읽기
+    delta=$(cat "$DELTA_FILE" 2>/dev/null || echo "0")
+
+    # 새 밝기 계산
+    new=$((current + delta))
+    [ $new -gt 100 ] && new=100
+    [ $new -lt 0 ] && new=0
+
+    # DDC로 밝기 설정
+    ddcutil $DDC_OPTS --bus="$BUS" setvcp 10 "$new" 2>/dev/null
+
+    # 캐시 업데이트 및 delta 초기화
+    (
+        flock -x 200
+        echo "$new" > "$CACHE_FILE"
+        echo "0" > "$DELTA_FILE"
+    ) 200>"$LOCK_FILE"
 ) &
